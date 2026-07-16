@@ -1,101 +1,101 @@
 # -*- coding: utf-8 -*-
 """
-Извлечение сущностей (какое число — какая физическая переменная) из текста
-условия задачи. Заменяет цепочку regex/ключевых слов в main.py::auto_extract_data
-на токен-классификатор.
+Извлечение сущностей (какое число — какая физическая переменная) из текста —
+версия на предобученном трансформере вместо BiLSTM с нуля.
 
-Идея разметки: каждое число в сгенерированном тексте (data_generator.py)
-попадает в текст ровно в одном месте — мы знаем точные символьные позиции
-благодаря render_with_spans(). Токенизация даёт числа отдельными токенами
-(TOKEN_RE ловит и слова, и числа), поэтому разметка получается плоской:
-каждому токену — метка "O" (не число) или имя переменной ('m', 'f_lens',
-'q1_ch', ...). BIO-теги (Begin/Inside) не нужны, потому что число — всегда
-один токен целиком, вложенных сущностей нет.
+Почему перешли: см. parserx.py — тот же диагноз (маленький словарь с нуля не
+тянет OOV-слова и падежные формы), только здесь ещё острее, потому что
+extraction — по-токенная задача, и цена ошибки на КАЖДОМ токене выше.
 
-Модель: nn.Embedding -> двунаправленный LSTM (важен контекст: "17 кг" и
-"17 Н" отличаются только соседним словом) -> линейный классификатор на
-каждый таймстеп.
+Как выравниваются метки с subword-токенизацией: наш data_generator.py
+сохраняет посимвольные спаны {var: [start, end]} для каждой переменной.
+Токенизатор трансформера (fast-токенизатор) при вызове с
+return_offsets_mapping=True возвращает для каждого subword-токена его
+собственные (start, end) в исходном тексте — сопоставляем спаны с
+токенами по пересечению символьных диапазонов, а не по словам. Это снимает
+проблему "у BERT свой word-piece словарь, не совпадающий с нашим
+word-level токенайзером" в принципе — токенизация не наша забота, только
+разметка поверх нее.
 
-ВАЖНО (как и с parserx.py): эта часть не была исполнена в песочнице
-разработки — нет torch/интернета. Логика токенизации/выравнивания/паддинга
-проверена отдельно на чистом Python (см. историю чата), но саму torch-часть
-нужно прогнать на твоей машине.
+Число, разбитое на несколько subword-кусков (например "200000.0" может
+распасться на несколько частей), помечается ОДНОЙ и той же меткой на всех
+кусках; при извлечении соседние токены с одинаковой меткой склеиваются
+обратно в один числовой спан перед парсингом в float.
+
+ВАЖНО: не исполнено в песочнице (нет torch/transformers/интернета для
+загрузки весов). Логика выравнивания спанов с offset_mapping — стандартный
+паттерн HuggingFace для token classification, но саму torch/transformers
+часть нужно прогнать и проверить на твоей машине.
+
+Требует: pip install transformers
 """
 
 import json
 import os
-import re
 import random
+import re
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
+from transformers import AutoTokenizer, AutoModel
 
-TOKEN_RE = re.compile(r'\d+\.?\d*(?:[eE][-+]?\d+)?|[a-zA-Zа-яА-ЯёЁ]+')
-NUM_RE = re.compile(r'^\d+\.?\d*(?:[eE][-+]?\d+)?$')
+MODEL_NAME = "cointegrated/rubert-tiny2"
 
 WEIGHTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights")
-MODEL_PATH = os.path.join(WEIGHTS_DIR, "extractor.pt")
-VOCAB_PATH = os.path.join(WEIGHTS_DIR, "extractor_vocab.json")
+MODEL_PATH = os.path.join(WEIGHTS_DIR, "extractor_bert.pt")
 LABELS_PATH = os.path.join(WEIGHTS_DIR, "extractor_labels.json")
 
 DEFAULT_DATASET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset_train.jsonl")
 
-MAX_LEN = 32
-EMBED_DIM = 48
-HIDDEN_DIM = 64
-NUM_TOKEN = "<num>"
+MAX_LEN = 64
+
+# "2*10^5", "1.6×10^-19", "3·10^8" — распространённая ручная запись научной
+# нотации. Нормализуем в обычное десятичное число ДО токенизации (тот же
+# фикс, что уже был в предыдущей версии extractor.py — здесь он так же нужен).
+SCI_NOTATION_RE = re.compile(r'(\d+(?:\.\d+)?)\s*[*×·xX]\s*10\s*\^\s*(-?\d+)')
 
 
-def tokenize(text: str):
-    return TOKEN_RE.findall(text)
+def normalize_scientific_notation(text: str) -> str:
+    def _replace(m):
+        base = float(m.group(1))
+        exp = int(m.group(2))
+        return str(base * (10 ** exp))
+    return SCI_NOTATION_RE.sub(_replace, text)
 
 
-def normalize(tok: str) -> str:
-    """Числа сворачиваются в один общий псевдо-токен <num> — конкретное
-    значение (17.03 против 81.39) не несёт лексической информации для
-    классификации, важен только факт "здесь стоит число" и контекст вокруг."""
-    return NUM_TOKEN if NUM_RE.match(tok) else tok.lower()
+# Приставки единиц измерения ("5 мкФ", "40 см", "8 мкКл") — сознательно НЕ
+# обучали модель распознавать масштаб приставки: это не задача для нейросети
+# (она учит СЕМАНТИКУ, какое число что означает), а детерминированное
+# правило. Правильнее выделить это в отдельный, предсказуемый шаг после
+# извлечения: модель находит правильное число и правильную метку, а масштаб
+# приставки домножается отдельно. Найдено на живом прогоне: "5 мкФ" (должно
+# быть 5e-6) извлекалось моделью как 5.0 — приставка "мк" игнорировалась
+# просто потому, что обучающий корпус НИКОГДА не использовал приставочную
+# запись (всегда писал сырое десятичное число в базовой единице СИ).
+UNIT_SCALE = {
+    "мккл": 1e-6, "мкл": 1e-6, "нкл": 1e-9, "пкл": 1e-12,
+    "мкф": 1e-6, "нф": 1e-9, "пф": 1e-12,
+    "ком": 1e3,
+    "мм": 1e-3, "см": 1e-2, "км": 1e3,
+    "мг": 1e-6, "г": 1e-3, "т": 1e3,
+    "мс": 1e-3, "мкс": 1e-6, "нс": 1e-9,
+}
+UNIT_WORD_RE = re.compile(r'[a-zа-яё]+', re.IGNORECASE)
 
 
-class Vocab:
-    PAD, UNK = "<pad>", "<unk>"
-
-    def __init__(self, token_lists=None, min_freq: int = 1):
-        if token_lists is None:
-            self.itos = [self.PAD, self.UNK, NUM_TOKEN]
-        else:
-            freq = {}
-            for tokens in token_lists:
-                for tok in tokens:
-                    norm = normalize(tok)
-                    freq[norm] = freq.get(norm, 0) + 1
-            words = sorted(w for w, c in freq.items() if c >= min_freq and w != NUM_TOKEN)
-            self.itos = [self.PAD, self.UNK, NUM_TOKEN] + words
-        self.stoi = {w: i for i, w in enumerate(self.itos)}
-
-    def __len__(self):
-        return len(self.itos)
-
-    def encode(self, tokens, max_len: int = MAX_LEN):
-        ids = [self.stoi.get(normalize(t), 1) for t in tokens][:max_len]
-        ids += [0] * (max_len - len(ids))
-        return ids
-
-    def to_json(self):
-        return {"itos": self.itos}
-
-    @classmethod
-    def from_json(cls, data):
-        v = cls.__new__(cls)
-        v.itos = data["itos"]
-        v.stoi = {w: i for i, w in enumerate(v.itos)}
-        return v
+def _apply_unit_scale(text: str, end_pos: int, value: float) -> float:
+    """Смотрит на слово сразу после числа; если это известная приставочная
+    единица — домножает значение на соответствующий масштаб. Любое
+    незнакомое или базовое слово (просто "м", "кг", "с", "Н"...) не входит
+    в таблицу и оставляет значение как есть — безопасный дефолт."""
+    tail = text[end_pos:end_pos + 12].strip().lower()
+    m = UNIT_WORD_RE.match(tail)
+    if not m:
+        return value
+    return value * UNIT_SCALE.get(m.group(), 1.0)
 
 
 class LabelSet:
-    """Множество меток: 'O' + все имена переменных, встреченные в корпусе."""
-
     def __init__(self, label_lists=None):
         if label_lists is None:
             self.itos = ["O"]
@@ -107,11 +107,6 @@ class LabelSet:
     def __len__(self):
         return len(self.itos)
 
-    def encode(self, labels, max_len: int = MAX_LEN):
-        ids = [self.stoi.get(l, 0) for l in labels][:max_len]
-        ids += [0] * (max_len - len(ids))  # паддинг размечаем как "O", но он всё равно маскируется в loss/inference
-        return ids
-
     def to_json(self):
         return {"itos": self.itos}
 
@@ -123,86 +118,120 @@ class LabelSet:
         return v
 
 
-class TaggerModel(nn.Module):
-    def __init__(self, vocab_size: int, num_labels: int,
-                 embed_dim: int = EMBED_DIM, hidden_dim: int = HIDDEN_DIM):
+class BertTagger(nn.Module):
+    def __init__(self, num_labels: int, model_name: str = MODEL_NAME):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.lstm = nn.LSTM(embed_dim, hidden_dim, batch_first=True, bidirectional=True)
-        self.dropout = nn.Dropout(0.2)
-        self.fc = nn.Linear(hidden_dim * 2, num_labels)
+        self.encoder = AutoModel.from_pretrained(model_name)
+        hidden = self.encoder.config.hidden_size
+        self.dropout = nn.Dropout(0.1)
+        self.fc = nn.Linear(hidden, num_labels)
 
-    def forward(self, x):
-        # x: (batch, seq_len)
-        emb = self.embedding(x)                 # (batch, seq_len, embed_dim)
-        out, _ = self.lstm(emb)                  # (batch, seq_len, hidden_dim*2)
-        out = self.dropout(out)
-        return self.fc(out)                       # (batch, seq_len, num_labels)
+    def forward(self, input_ids, attention_mask):
+        out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        h = self.dropout(out.last_hidden_state)   # (batch, seq, hidden)
+        return self.fc(h)                          # (batch, seq, num_labels)
 
 
 class PyTorchExtractor:
-    """
-    Извлекает {переменная: значение} из текста условия. Как и PyTorchParser:
-    обучается один раз (если весов ещё нет на диске), дальше просто грузит.
-    """
-
-    def __init__(self, dataset_path: str = DEFAULT_DATASET_PATH, force_retrain: bool = False):
+    def __init__(self, dataset_path: str = DEFAULT_DATASET_PATH, force_retrain: bool = False,
+                 model_name: str = MODEL_NAME):
+        self.model_name = model_name
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else
             ("mps" if torch.backends.mps.is_available() else "cpu")
         )
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if not self.tokenizer.is_fast:
+            raise RuntimeError(
+                f"Токенизатор {model_name} не 'fast' — нужен offset_mapping для "
+                f"выравнивания меток по символам. Выбери модель с fast-токенизатором."
+            )
 
-        if force_retrain or not (os.path.exists(MODEL_PATH) and os.path.exists(VOCAB_PATH)
-                                  and os.path.exists(LABELS_PATH)):
+        if force_retrain or not (os.path.exists(MODEL_PATH) and os.path.exists(LABELS_PATH)):
             self._train_and_save(dataset_path)
         else:
             self._load()
 
-        print(f"[Extractor] Готов ({len(self.labels)} меток переменных, "
-              f"словарь {len(self.vocab)} токенов) на девайсе: {self.device}")
+        print(f"[BERT-Extractor] Готов ({len(self.labels)} меток, база {self.model_name}) "
+              f"на девайсе: {self.device}")
 
     # ------------------------------------------------------------------
-    def _train_and_save(self, dataset_path: str, epochs: int = 25, batch_size: int = 32,
-                         lr: float = 1e-3, val_split: float = 0.15, seed: int = 0):
+    def _encode_with_labels(self, text: str, spans: dict, label_to_id: dict):
+        """Токенизирует один пример и строит label_ids, выровненные по
+        символьным спанам. -100 — служебное значение, игнорируется в loss
+        (паддинг и спецтокены [CLS]/[SEP])."""
+        enc = self.tokenizer(text, truncation=True, max_length=MAX_LEN, return_offsets_mapping=True)
+        offsets = enc["offset_mapping"]
+        label_ids = []
+        for start, end in offsets:
+            if start == end:
+                label_ids.append(-100)
+                continue
+            label = "O"
+            for var, (vs, ve) in spans.items():
+                if start >= vs and end <= ve:
+                    label = var
+                    break
+            label_ids.append(label_to_id.get(label, 0))
+        return enc["input_ids"], label_ids
+
+    def _pad_batch(self, ids_list, label_ids_list):
+        max_len = max(len(x) for x in ids_list)
+        pad_id = self.tokenizer.pad_token_id
+        input_ids, attention_mask, labels = [], [], []
+        for ids, labs in zip(ids_list, label_ids_list):
+            pad_n = max_len - len(ids)
+            input_ids.append(ids + [pad_id] * pad_n)
+            attention_mask.append([1] * len(ids) + [0] * pad_n)
+            labels.append(labs + [-100] * pad_n)
+        return (torch.tensor(input_ids, dtype=torch.long).to(self.device),
+                torch.tensor(attention_mask, dtype=torch.long).to(self.device),
+                torch.tensor(labels, dtype=torch.long).to(self.device))
+
+    # ------------------------------------------------------------------
+    def _train_and_save(self, dataset_path: str, epochs: int = 8, batch_size: int = 16,
+                         lr: float = 2e-5, val_split: float = 0.15, seed: int = 0):
         if not os.path.exists(dataset_path):
             raise FileNotFoundError(
                 f"Не найден обучающий корпус: {dataset_path}. "
-                f"Сгенерируй его: python3 data_generator.py --per-template 150 --out dataset_train.jsonl"
+                f"Сгенерируй: python3 data_generator.py --per-template 200 --out dataset_train.jsonl"
             )
 
         random.seed(seed)
         torch.manual_seed(seed)
 
         rows = [json.loads(line) for line in open(dataset_path, encoding="utf-8")]
-        rows = [r for r in rows if "tokens" in r and "labels" in r]
+        rows = [r for r in rows if "spans" in r]
         if not rows:
             raise ValueError(
-                "В корпусе нет полей 'tokens'/'labels' — перегенерируй датасет "
-                "текущей версией data_generator.py (со span-разметкой)."
+                "В корпусе нет поля 'spans' — перегенерируй датасет текущей версией "
+                "data_generator.py (с посимвольными спанами для BERT-выравнивания)."
             )
         random.shuffle(rows)
 
-        vocab = Vocab([r["tokens"] for r in rows], min_freq=1)
-        labels = LabelSet([r["labels"] for r in rows])
+        labels = LabelSet([list(r["spans"].keys()) + ["O"] for r in rows])
+        label_to_id = labels.stoi
 
         n_val = max(1, int(len(rows) * val_split))
         train_rows, val_rows = rows[n_val:], rows[:n_val]
 
-        def make_batch(row_slice):
-            X = torch.tensor([vocab.encode(r["tokens"]) for r in row_slice], dtype=torch.long)
-            Y = torch.tensor([labels.encode(r["labels"]) for r in row_slice], dtype=torch.long)
-            mask = torch.tensor(
-                [[1 if i < len(r["tokens"]) else 0 for i in range(MAX_LEN)] for r in row_slice],
-                dtype=torch.bool,
-            )
-            return X, Y, mask
+        def prep(rs):
+            ids_list, labs_list = [], []
+            for r in rs:
+                spans = {k: tuple(v) for k, v in r["spans"].items()}
+                ids, labs = self._encode_with_labels(r["text"], spans, label_to_id)
+                ids_list.append(ids)
+                labs_list.append(labs)
+            return ids_list, labs_list
 
-        model = TaggerModel(len(vocab), len(labels)).to(self.device)
-        optimizer = optim.Adam(model.parameters(), lr=lr)
-        criterion = nn.CrossEntropyLoss(reduction="none")
+        val_ids_list, val_labs_list = prep(val_rows)
+        val_input_ids, val_mask, val_labels = self._pad_batch(val_ids_list, val_labs_list)
 
-        X_val, Y_val, M_val = make_batch(val_rows)
-        X_val, Y_val, M_val = X_val.to(self.device), Y_val.to(self.device), M_val.to(self.device)
+        model = BertTagger(len(labels), self.model_name).to(self.device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+        criterion = nn.CrossEntropyLoss(ignore_index=-100)
+
+        train_ids_list, train_labs_list = prep(train_rows)
 
         model.train()
         for epoch in range(epochs):
@@ -211,78 +240,93 @@ class PyTorchExtractor:
             total_loss, total_tokens = 0.0, 0
             for start in range(0, len(perm), batch_size):
                 idx = perm[start:start + batch_size]
-                batch_rows = [train_rows[i] for i in idx]
-                X, Y, mask = make_batch(batch_rows)
-                X, Y, mask = X.to(self.device), Y.to(self.device), mask.to(self.device)
+                batch_ids = [train_ids_list[i] for i in idx]
+                batch_labs = [train_labs_list[i] for i in idx]
+                input_ids, mask, labs = self._pad_batch(batch_ids, batch_labs)
 
                 optimizer.zero_grad()
-                logits = model(X)                                    # (batch, seq_len, num_labels)
-                loss_per_tok = criterion(logits.transpose(1, 2), Y)   # (batch, seq_len)
-                loss = (loss_per_tok * mask.float()).sum() / mask.float().sum().clamp(min=1.0)
+                logits = model(input_ids, mask)
+                loss = criterion(logits.transpose(1, 2), labs)
                 loss.backward()
                 optimizer.step()
 
-                total_loss += loss.item() * mask.sum().item()
-                total_tokens += mask.sum().item()
+                n_tok = (labs != -100).sum().item()
+                total_loss += loss.item() * n_tok
+                total_tokens += n_tok
 
-            if (epoch + 1) % 5 == 0 or epoch == epochs - 1:
-                model.eval()
-                with torch.no_grad():
-                    val_logits = model(X_val)
-                    val_pred = val_logits.argmax(-1)
-                    correct = ((val_pred == Y_val) & M_val).sum().item()
-                    total = M_val.sum().item()
-                model.train()
-                print(f"[Extractor] epoch {epoch + 1}/{epochs}  "
-                      f"loss={total_loss / max(total_tokens,1):.4f}  "
-                      f"val_token_acc={correct / max(total,1):.3f}")
+            model.eval()
+            with torch.no_grad():
+                val_logits = model(val_input_ids, val_mask)
+                val_pred = val_logits.argmax(-1)
+                mask_valid = val_labels != -100
+                correct = ((val_pred == val_labels) & mask_valid).sum().item()
+                total = mask_valid.sum().item()
+            model.train()
+            print(f"[BERT-Extractor] epoch {epoch + 1}/{epochs}  "
+                  f"loss={total_loss / max(total_tokens,1):.4f}  "
+                  f"val_token_acc={correct / max(total,1):.3f}")
 
         model.eval()
         os.makedirs(WEIGHTS_DIR, exist_ok=True)
         torch.save(model.state_dict(), MODEL_PATH)
-        with open(VOCAB_PATH, "w", encoding="utf-8") as f:
-            json.dump(vocab.to_json(), f, ensure_ascii=False)
         with open(LABELS_PATH, "w", encoding="utf-8") as f:
             json.dump(labels.to_json(), f, ensure_ascii=False)
 
-        self.model, self.vocab, self.labels = model, vocab, labels
+        self.model, self.labels = model, labels
 
     # ------------------------------------------------------------------
     def _load(self):
-        with open(VOCAB_PATH, encoding="utf-8") as f:
-            self.vocab = Vocab.from_json(json.load(f))
         with open(LABELS_PATH, encoding="utf-8") as f:
             self.labels = LabelSet.from_json(json.load(f))
-
-        self.model = TaggerModel(len(self.vocab), len(self.labels)).to(self.device)
+        self.model = BertTagger(len(self.labels), self.model_name).to(self.device)
         self.model.load_state_dict(torch.load(MODEL_PATH, map_location=self.device))
         self.model.eval()
 
     # ------------------------------------------------------------------
     def extract(self, text: str) -> dict:
-        """
-        Возвращает {имя_переменной: числовое_значение}, разобранные из текста.
-        Если одна переменная встречается несколько раз (не должно происходить
-        в норме), побеждает последнее по тексту вхождение.
-        """
-        tokens = tokenize(text)
-        ids = torch.tensor([self.vocab.encode(tokens)], dtype=torch.long).to(self.device)
+        """Возвращает {имя_переменной: числовое_значение}. Соседние
+        subword-токены с одинаковой предсказанной меткой склеиваются в один
+        числовой спан перед парсингом — число может распасться на несколько
+        кусков токенизации, но семантически это одно значение."""
+        text = normalize_scientific_notation(text)
+        enc = self.tokenizer(text, truncation=True, max_length=MAX_LEN, return_offsets_mapping=True,
+                              return_tensors="pt")
+        offsets = enc.pop("offset_mapping")[0].tolist()
+        input_ids = enc["input_ids"].to(self.device)
+        attention_mask = enc["attention_mask"].to(self.device)
+
         self.model.eval()
         with torch.no_grad():
-            logits = self.model(ids)[0]                     # (seq_len, num_labels)
+            logits = self.model(input_ids, attention_mask)[0]
             pred_ids = logits.argmax(-1).tolist()
 
         result = {}
-        for i, tok in enumerate(tokens[:MAX_LEN]):
-            label = self.labels.itos[pred_ids[i]]
-            if label == "O":
-                continue
-            if not NUM_RE.match(tok):
-                continue  # модель предсказала переменную не на числовом токене — считаем шумом
+        cur_label, cur_start, cur_end = None, None, None
+
+        def _flush():
+            if cur_label is None:
+                return
+            substr = text[cur_start:cur_end]
             try:
-                result[label] = float(tok)
+                value = float(substr)
+                result[cur_label] = _apply_unit_scale(text, cur_end, value)
             except ValueError:
-                continue
+                pass
+
+        for (start, end), pid in zip(offsets, pred_ids):
+            if start == end:
+                label = None  # спецтокен ([CLS]/[SEP]/[PAD])
+            else:
+                lab = self.labels.itos[pid]
+                label = None if lab == "O" else lab
+
+            if label == cur_label and label is not None:
+                cur_end = end
+            else:
+                _flush()
+                cur_label, cur_start, cur_end = label, start, end
+        _flush()
+
         return result
 
 
@@ -290,8 +334,8 @@ if __name__ == "__main__":
     extractor = PyTorchExtractor()
     samples = [
         "На тело массой 3 кг действует сила 15 Н. Найдите ускорение.",
-        "Два заряда 2e-06 Кл и 3e-06 Кл на расстоянии 0.4 м. Найдите силу.",
-        "Резистор сопротивлением 10 Ом подключен к источнику напряжением 20 В.",
+        "Два заряда 2*10^-6 Кл и 3*10^-6 Кл на расстоянии 0.4 м. Найдите силу.",
+        "Лампочка с сопротивлением 15 Ом подключена к батарейке, дающей 9 вольт.",
     ]
     for s in samples:
         print(s)

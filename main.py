@@ -21,7 +21,7 @@ from physics_db import UNITS_MAP, WORDS_MAP, SYMBOLS_MAP
 from parserx import PyTorchParser
 from solver import PhysicsSolver
 from explainer import PhysicsExplainer
-from extractor import PyTorchExtractor
+from extractor import PyTorchExtractor, normalize_scientific_notation
 
 PREMIUM_CORPORATE_STYLE = """
     QWidget {
@@ -192,6 +192,12 @@ class PhysAIGUI(QWidget):
     # ИНТЕЛЛЕКТУАЛЬНЫЙ NLP-ЭКСТРАКТОР СКРЫТЫХ ПРОПОРЦИЙ И ПОДВОХОВ
     # =========================================================================
     def auto_extract_data(self, text: str):
+        # "2*10^5" и подобная ручная запись научной нотации нормализуется
+        # в обычное десятичное число ДО того, как текст попадёт и в
+        # extractor (модель), и в regex-фолбэк ниже — иначе оба способа
+        # ошибочно разбивают такую запись на несколько чисел (баг, найденный
+        # на живом прогоне: "2*10^5 Па" извлекалось как значение 5.0).
+        text = normalize_scientific_notation(text)
         clean_text = text.lower().replace(",", ".")
         clean_text = re.sub(r'\.(?=\s|$)', ' ', clean_text)
         clean_text = re.sub(r'[?!;:]', ' ', clean_text)

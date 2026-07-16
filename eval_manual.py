@@ -22,6 +22,7 @@
 
 import json
 import os
+import signal
 
 EVAL_SET = [
     # --- Кинематика ---
@@ -29,14 +30,14 @@ EVAL_SET = [
         "text": "Автомобиль трогается с места и через 8 секунд движения набирает скорость 24 м/с. "
                 "Каким было его ускорение?",
         "category": "Кинематика",
-        "given": {"v0": 0.0, "t": 8.0, "v": 24.0},
+        "given": {"t": 8.0, "v": 24.0},
         "target": "a",
     },
     {
         "text": "Мотоциклист разгоняется с места с ускорением 3.5 м/с². Сколько метров он "
                 "проедет за первые 7 секунд?",
         "category": "Кинематика",
-        "given": {"v0": 0.0, "a": 3.5, "t": 7.0},
+        "given": {"a": 3.5, "t": 7.0},
         "target": "s",
     },
     {
@@ -313,11 +314,29 @@ def run_eval():
         extraction_exact += exact
 
         # end-to-end: используем ПРЕДСКАЗАННЫЕ категорию и данные (не эталонные!)
+        # Таймаут обязателен: если extractor выдал "мусорные" данные (перепутанные
+        # переменные, дикие порядки величин), система уравнений иногда уходит в
+        # патологический случай, на котором sp.solve может зависнуть на очень
+        # долго — один плохой пример не должен вешать весь прогон эвала.
+        class _EvalTimeout(Exception):
+            pass
+
+        def _on_timeout(signum, frame):
+            raise _EvalTimeout()
+
+        old_handler = signal.signal(signal.SIGALRM, _on_timeout)
+        signal.alarm(8)
         try:
             result, _ = solver.calculate(dict(pred_given), ex["target"], pred_cat, ex["text"])
             solved = isinstance(result, (int, float))
+        except _EvalTimeout:
+            solved = False
+            result = "TIMEOUT (>8s)"
         except Exception:
             solved = False
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
         solved_end_to_end += solved
 
         status = "OK " if (cat_ok and exact and solved) else "..."

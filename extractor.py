@@ -283,11 +283,20 @@ class PyTorchExtractor:
         self.model.eval()
 
     # ------------------------------------------------------------------
-    def extract(self, text: str) -> dict:
-        """Возвращает {имя_переменной: числовое_значение}. Соседние
-        subword-токены с одинаковой предсказанной меткой склеиваются в один
-        числовой спан перед парсингом — число может распасться на несколько
-        кусков токенизации, но семантически это одно значение."""
+    def extract_full(self, text: str):
+        """
+        Возвращает (given, target):
+          - given: {имя_переменной: число} — как раньше.
+          - target: имя переменной, которую текст называет как искомую
+            (например "Найдите ускорение" -> target='a'), или None, если
+            модель не нашла явного упоминания цели.
+
+        Работает той же моделью и тем же набором меток, что и для given-значений:
+        числовой спан с меткой — это "дано", словесный спан с меткой (не
+        парсится как число) — это упоминание цели. Одна архитектура решает
+        обе задачи, потому что при обучении данные размечены единообразно
+        (см. ⟦...⟧-разметка в data_generator.py).
+        """
         text = normalize_scientific_notation(text)
         enc = self.tokenizer(text, truncation=True, max_length=MAX_LEN, return_offsets_mapping=True,
                               return_tensors="pt")
@@ -300,7 +309,8 @@ class PyTorchExtractor:
             logits = self.model(input_ids, attention_mask)[0]
             pred_ids = logits.argmax(-1).tolist()
 
-        result = {}
+        given = {}
+        target_candidates = []  # (span_length, label) — на случай нескольких кандидатов
         cur_label, cur_start, cur_end = None, None, None
 
         def _flush():
@@ -309,9 +319,11 @@ class PyTorchExtractor:
             substr = text[cur_start:cur_end]
             try:
                 value = float(substr)
-                result[cur_label] = _apply_unit_scale(text, cur_end, value)
+                given[cur_label] = _apply_unit_scale(text, cur_end, value)
             except ValueError:
-                pass
+                # Нечисловой спан с реальной меткой — упоминание цели словом,
+                # а не числом ("ускорение", "силу тока", "период колебаний"...).
+                target_candidates.append((cur_end - cur_start, cur_label))
 
         for (start, end), pid in zip(offsets, pred_ids):
             if start == end:
@@ -327,7 +339,20 @@ class PyTorchExtractor:
                 cur_label, cur_start, cur_end = label, start, end
         _flush()
 
-        return result
+        # Если несколько кандидатов на цель — берём тот, что подкреплён
+        # самым длинным спаном (обычно самый уверенный/специфичный).
+        target = max(target_candidates, key=lambda x: x[0])[1] if target_candidates else None
+
+        return given, target
+
+    def extract(self, text: str) -> dict:
+        """Обратно совместимая обёртка: только {имя_переменной: значение},
+        без цели. Соседние subword-токены с одинаковой предсказанной меткой
+        склеиваются в один числовой спан перед парсингом — число может
+        распасться на несколько кусков токенизации, но семантически это
+        одно значение."""
+        given, _ = self.extract_full(text)
+        return given
 
 
 if __name__ == "__main__":
@@ -338,5 +363,6 @@ if __name__ == "__main__":
         "Лампочка с сопротивлением 15 Ом подключена к батарейке, дающей 9 вольт.",
     ]
     for s in samples:
+        given, target = extractor.extract_full(s)
         print(s)
-        print("  ->", extractor.extract(s))
+        print(f"  дано={given}  цель={target}")

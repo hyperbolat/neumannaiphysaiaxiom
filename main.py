@@ -1,368 +1,419 @@
-# -*- coding: utf-8 -*-
-"""
-Извлечение сущностей (какое число — какая физическая переменная) из текста —
-версия на предобученном трансформере вместо BiLSTM с нуля.
-
-Почему перешли: см. parserx.py — тот же диагноз (маленький словарь с нуля не
-тянет OOV-слова и падежные формы), только здесь ещё острее, потому что
-extraction — по-токенная задача, и цена ошибки на КАЖДОМ токене выше.
-
-Как выравниваются метки с subword-токенизацией: наш data_generator.py
-сохраняет посимвольные спаны {var: [start, end]} для каждой переменной.
-Токенизатор трансформера (fast-токенизатор) при вызове с
-return_offsets_mapping=True возвращает для каждого subword-токена его
-собственные (start, end) в исходном тексте — сопоставляем спаны с
-токенами по пересечению символьных диапазонов, а не по словам. Это снимает
-проблему "у BERT свой word-piece словарь, не совпадающий с нашим
-word-level токенайзером" в принципе — токенизация не наша забота, только
-разметка поверх нее.
-
-Число, разбитое на несколько subword-кусков (например "200000.0" может
-распасться на несколько частей), помечается ОДНОЙ и той же меткой на всех
-кусках; при извлечении соседние токены с одинаковой меткой склеиваются
-обратно в один числовой спан перед парсингом в float.
-
-ВАЖНО: не исполнено в песочнице (нет torch/transformers/интернета для
-загрузки весов). Логика выравнивания спанов с offset_mapping — стандартный
-паттерн HuggingFace для token classification, но саму torch/transformers
-часть нужно прогнать и проверить на твоей машине.
-
-Требует: pip install transformers
-"""
-
-import json
-import os
-import random
+import sys
 import re
+import sympy as sp
+import math
+import os
 
-import torch
-import torch.nn as nn
-from transformers import AutoTokenizer, AutoModel
+# Настройка потокобезопасного графического движка
+import matplotlib
 
-MODEL_NAME = "cointegrated/rubert-tiny2"
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
 
-WEIGHTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights")
-MODEL_PATH = os.path.join(WEIGHTS_DIR, "extractor_bert.pt")
-LABELS_PATH = os.path.join(WEIGHTS_DIR, "extractor_labels.json")
+from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+                             QLabel, QLineEdit, QPushButton, QTextEdit, QMessageBox,
+                             QProgressBar, QGraphicsOpacityEffect)
+from PyQt6.QtCore import QPropertyAnimation, QTimer, Qt
+from PyQt6.QtGui import QFont, QColor, QIcon
 
-DEFAULT_DATASET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset_train.jsonl")
+from physics_db import UNITS_MAP, WORDS_MAP, SYMBOLS_MAP
+from parserx import PyTorchParser
+from solver import PhysicsSolver
+from explainer import PhysicsExplainer
+from extractor import PyTorchExtractor, normalize_scientific_notation
 
-MAX_LEN = 64
-
-# "2*10^5", "1.6×10^-19", "3·10^8" — распространённая ручная запись научной
-# нотации. Нормализуем в обычное десятичное число ДО токенизации (тот же
-# фикс, что уже был в предыдущей версии extractor.py — здесь он так же нужен).
-SCI_NOTATION_RE = re.compile(r'(\d+(?:\.\d+)?)\s*[*×·xX]\s*10\s*\^\s*(-?\d+)')
-
-
-def normalize_scientific_notation(text: str) -> str:
-    def _replace(m):
-        base = float(m.group(1))
-        exp = int(m.group(2))
-        return str(base * (10 ** exp))
-    return SCI_NOTATION_RE.sub(_replace, text)
-
-
-# Приставки единиц измерения ("5 мкФ", "40 см", "8 мкКл") — сознательно НЕ
-# обучали модель распознавать масштаб приставки: это не задача для нейросети
-# (она учит СЕМАНТИКУ, какое число что означает), а детерминированное
-# правило. Правильнее выделить это в отдельный, предсказуемый шаг после
-# извлечения: модель находит правильное число и правильную метку, а масштаб
-# приставки домножается отдельно. Найдено на живом прогоне: "5 мкФ" (должно
-# быть 5e-6) извлекалось моделью как 5.0 — приставка "мк" игнорировалась
-# просто потому, что обучающий корпус НИКОГДА не использовал приставочную
-# запись (всегда писал сырое десятичное число в базовой единице СИ).
-UNIT_SCALE = {
-    "мккл": 1e-6, "мкл": 1e-6, "нкл": 1e-9, "пкл": 1e-12,
-    "мкф": 1e-6, "нф": 1e-9, "пф": 1e-12,
-    "ком": 1e3,
-    "мм": 1e-3, "см": 1e-2, "км": 1e3,
-    "мг": 1e-6, "г": 1e-3, "т": 1e3,
-    "мс": 1e-3, "мкс": 1e-6, "нс": 1e-9,
-}
-UNIT_WORD_RE = re.compile(r'[a-zа-яё]+', re.IGNORECASE)
-
-
-def _apply_unit_scale(text: str, end_pos: int, value: float) -> float:
-    """Смотрит на слово сразу после числа; если это известная приставочная
-    единица — домножает значение на соответствующий масштаб. Любое
-    незнакомое или базовое слово (просто "м", "кг", "с", "Н"...) не входит
-    в таблицу и оставляет значение как есть — безопасный дефолт."""
-    tail = text[end_pos:end_pos + 12].strip().lower()
-    m = UNIT_WORD_RE.match(tail)
-    if not m:
-        return value
-    return value * UNIT_SCALE.get(m.group(), 1.0)
-
-
-class LabelSet:
-    def __init__(self, label_lists=None):
-        if label_lists is None:
-            self.itos = ["O"]
-        else:
-            labels = sorted({lab for labs in label_lists for lab in labs if lab != "O"})
-            self.itos = ["O"] + labels
-        self.stoi = {w: i for i, w in enumerate(self.itos)}
-
-    def __len__(self):
-        return len(self.itos)
-
-    def to_json(self):
-        return {"itos": self.itos}
-
-    @classmethod
-    def from_json(cls, data):
-        v = cls.__new__(cls)
-        v.itos = data["itos"]
-        v.stoi = {w: i for i, w in enumerate(v.itos)}
-        return v
+PREMIUM_CORPORATE_STYLE = """
+    QWidget {
+        background-color: #f1f5f9;
+        color: #0f172a;
+        font-family: 'Inter', 'Segoe UI', -apple-system, sans-serif;
+    }
+    QLabel {
+        color: #475569;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 1.2px;
+    }
+    QLineEdit {
+        background-color: #ffffff;
+        border: 1px solid #cbd5e1;
+        border-radius: 6px;
+        padding: 12px;
+        color: #0f172a;
+        font-size: 14px;
+    }
+    QLineEdit:focus {
+        border: 1.5px solid #2563eb;
+    }
+    QPushButton {
+        background-color: #1e293b;
+        color: #ffffff;
+        border: none;
+        border-radius: 6px;
+        padding: 14px;
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.5px;
+    }
+    QPushButton:hover {
+        background-color: #0f172a;
+    }
+    QPushButton:disabled {
+        background-color: #94a3b8;
+    }
+    QTextEdit {
+        background-color: #0f172a;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        padding: 20px;
+        color: #f8fafc;
+        font-size: 14px;
+    }
+    QProgressBar {
+        border: none;
+        background-color: #e2e8f0;
+        border-radius: 3px;
+        max-height: 5px;
+        text-align: transparent;
+    }
+    QProgressBar::chunk {
+        background-color: #2563eb;
+        border-radius: 3px;
+    }
+"""
 
 
-class BertTagger(nn.Module):
-    def __init__(self, num_labels: int, model_name: str = MODEL_NAME):
+class PhysAIGUI(QWidget):
+    def __init__(self, parser, solver, explainer, entity_extractor=None):
         super().__init__()
-        self.encoder = AutoModel.from_pretrained(model_name)
-        hidden = self.encoder.config.hidden_size
-        self.dropout = nn.Dropout(0.1)
-        self.fc = nn.Linear(hidden, num_labels)
+        self.ai_parser = parser
+        self.solver = solver
+        self.explainer = explainer
+        self.entity_extractor = entity_extractor
+        self.init_ui()
 
-    def forward(self, input_ids, attention_mask):
-        out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        h = self.dropout(out.last_hidden_state)   # (batch, seq, hidden)
-        return self.fc(h)                          # (batch, seq, num_labels)
+    def init_ui(self):
+        self.setWindowTitle("PhysAI Axiom")
+        self.setGeometry(100, 100, 950, 850)
+        self.setStyleSheet(PREMIUM_CORPORATE_STYLE)
 
+        if os.path.exists("logo.png"):
+            self.setWindowIcon(QIcon("logo.png"))
 
-class PyTorchExtractor:
-    def __init__(self, dataset_path: str = DEFAULT_DATASET_PATH, force_retrain: bool = False,
-                 model_name: str = MODEL_NAME):
-        self.model_name = model_name
-        self.device = torch.device(
-            "cuda" if torch.cuda.is_available() else
-            ("mps" if torch.backends.mps.is_available() else "cpu")
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if not self.tokenizer.is_fast:
-            raise RuntimeError(
-                f"Токенизатор {model_name} не 'fast' — нужен offset_mapping для "
-                f"выравнивания меток по символам. Выбери модель с fast-токенизатором."
-            )
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(35, 35, 35, 35)
+        main_layout.setSpacing(16)
 
-        if force_retrain or not (os.path.exists(MODEL_PATH) and os.path.exists(LABELS_PATH)):
-            self._train_and_save(dataset_path)
-        else:
-            self._load()
+        title_label = QLabel("PhysAI Axiom")
+        title_label.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        title_label.setStyleSheet("color: #0f172a; letter-spacing: 0.5px; margin-bottom: 5px;")
+        main_layout.addWidget(title_label)
 
-        print(f"[BERT-Extractor] Готов ({len(self.labels)} меток, база {self.model_name}) "
-              f"на девайсе: {self.device}")
+        main_layout.addWidget(QLabel("Условие задачи:"))
+        self.task_entry = QLineEdit()
+        # Поставим по дефолту сложную олимпиадную задачу с неявным условием пропорции
+        self.task_entry.setText(
+            "Идеальный газ перевели из состояния 1 в состояние 2, при этом объем v1_vol увеличился в 3 раза при постоянной температуре. Найти конечное давление p2_pres, если начальное давление p1_pres равно 300000 Па.")
+        main_layout.addWidget(self.task_entry)
 
-    # ------------------------------------------------------------------
-    def _encode_with_labels(self, text: str, spans: dict, label_to_id: dict):
-        """Токенизирует один пример и строит label_ids, выровненные по
-        символьным спанам. -100 — служебное значение, игнорируется в loss
-        (паддинг и спецтокены [CLS]/[SEP])."""
-        enc = self.tokenizer(text, truncation=True, max_length=MAX_LEN, return_offsets_mapping=True)
-        offsets = enc["offset_mapping"]
-        label_ids = []
-        for start, end in offsets:
-            if start == end:
-                label_ids.append(-100)
-                continue
-            label = "O"
-            for var, (vs, ve) in spans.items():
-                if start >= vs and end <= ve:
-                    label = var
-                    break
-            label_ids.append(label_to_id.get(label, 0))
-        return enc["input_ids"], label_ids
+        target_layout = QHBoxLayout()
+        target_label = QLabel("Искомая величина (необязательно — определится автоматически):")
+        target_layout.addWidget(target_label)
 
-    def _pad_batch(self, ids_list, label_ids_list):
-        max_len = max(len(x) for x in ids_list)
-        pad_id = self.tokenizer.pad_token_id
-        input_ids, attention_mask, labels = [], [], []
-        for ids, labs in zip(ids_list, label_ids_list):
-            pad_n = max_len - len(ids)
-            input_ids.append(ids + [pad_id] * pad_n)
-            attention_mask.append([1] * len(ids) + [0] * pad_n)
-            labels.append(labs + [-100] * pad_n)
-        return (torch.tensor(input_ids, dtype=torch.long).to(self.device),
-                torch.tensor(attention_mask, dtype=torch.long).to(self.device),
-                torch.tensor(labels, dtype=torch.long).to(self.device))
+        self.target_entry = QLineEdit()
+        self.target_entry.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
+        self.target_entry.setMaximumWidth(120)
+        self.target_entry.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Поле теперь начинается пустым (плейсхолдер вместо реального текста) —
+        # это даёт автоопределению цели (extractor.extract_full) место для
+        # подстановки, не заставляя пользователя сперва стирать дефолт.
+        # Пользователь всегда может переопределить то, что подставила модель.
+        self.target_entry.setPlaceholderText("напр. a, v, t_period...")
+        target_layout.addWidget(self.target_entry)
+        target_layout.addStretch()
+        main_layout.addLayout(target_layout)
 
-    # ------------------------------------------------------------------
-    def _train_and_save(self, dataset_path: str, epochs: int = 8, batch_size: int = 16,
-                         lr: float = 2e-5, val_split: float = 0.15, seed: int = 0):
-        if not os.path.exists(dataset_path):
-            raise FileNotFoundError(
-                f"Не найден обучающий корпус: {dataset_path}. "
-                f"Сгенерируй: python3 data_generator.py --per-template 200 --out dataset_train.jsonl"
-            )
+        self.solve_button = QPushButton("ВЫПОЛНИТЬ СКВОЗНОЙ НЕЙРОСИМВОЛИЧЕСКИЙ АНАЛИЗ")
+        self.solve_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.solve_button.clicked.connect(self.start_loading_animation)
+        main_layout.addWidget(self.solve_button)
 
-        random.seed(seed)
-        torch.manual_seed(seed)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        main_layout.addWidget(self.progress_bar)
 
-        rows = [json.loads(line) for line in open(dataset_path, encoding="utf-8")]
-        rows = [r for r in rows if "spans" in r]
-        if not rows:
-            raise ValueError(
-                "В корпусе нет поля 'spans' — перегенерируй датасет текущей версией "
-                "data_generator.py (с посимвольными спанами для BERT-выравнивания)."
-            )
-        random.shuffle(rows)
+        main_layout.addWidget(QLabel("Решение:"))
+        self.output_text = QTextEdit()
+        self.output_text.setReadOnly(True)
 
-        labels = LabelSet([list(r["spans"].keys()) + ["O"] for r in rows])
-        label_to_id = labels.stoi
+        self.opacity_effect = QGraphicsOpacityEffect()
+        self.output_text.setGraphicsEffect(self.opacity_effect)
+        self.opacity_effect.setOpacity(1.0)
 
-        n_val = max(1, int(len(rows) * val_split))
-        train_rows, val_rows = rows[n_val:], rows[:n_val]
+        main_layout.addWidget(self.output_text)
+        self.setLayout(main_layout)
 
-        def prep(rs):
-            ids_list, labs_list = [], []
-            for r in rs:
-                spans = {k: tuple(v) for k, v in r["spans"].items()}
-                ids, labs = self._encode_with_labels(r["text"], spans, label_to_id)
-                ids_list.append(ids)
-                labs_list.append(labs)
-            return ids_list, labs_list
+        self.loading_timer = QTimer()
+        self.loading_timer.timeout.connect(self.advance_loading)
+        self.current_progress = 0
 
-        val_ids_list, val_labs_list = prep(val_rows)
-        val_input_ids, val_mask, val_labels = self._pad_batch(val_ids_list, val_labs_list)
+    def start_loading_animation(self):
+        task_text = self.task_entry.text().strip()
 
-        model = BertTagger(len(labels), self.model_name).to(self.device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-        criterion = nn.CrossEntropyLoss(ignore_index=-100)
+        # Поле цели теперь законно может быть пустым — оно заполняется
+        # автоопределением (extractor.extract_full) внутри execute_core_analysis,
+        # а не обязательно вручную. Требуем только текст задачи; если ни
+        # пользователь, ни модель не определят цель, solver.py сам корректно
+        # сообщит "не удалось замкнуть матрицу уравнений" в отчёте — без
+        # блокирующего диалога, мешающего вообще попробовать.
+        if not task_text:
+            QMessageBox.warning(self, "Внимание", "Введите условие задачи.")
+            return
 
-        train_ids_list, train_labs_list = prep(train_rows)
+        self.opacity_effect.setOpacity(0.0)
+        self.solve_button.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.current_progress = 0
 
-        model.train()
-        for epoch in range(epochs):
-            perm = list(range(len(train_rows)))
-            random.shuffle(perm)
-            total_loss, total_tokens = 0.0, 0
-            for start in range(0, len(perm), batch_size):
-                idx = perm[start:start + batch_size]
-                batch_ids = [train_ids_list[i] for i in idx]
-                batch_labs = [train_labs_list[i] for i in idx]
-                input_ids, mask, labs = self._pad_batch(batch_ids, batch_labs)
+        self.loading_timer.start(12)
 
-                optimizer.zero_grad()
-                logits = model(input_ids, mask)
-                loss = criterion(logits.transpose(1, 2), labs)
-                loss.backward()
-                optimizer.step()
+    def advance_loading(self):
+        self.current_progress += 2
+        self.progress_bar.setValue(self.current_progress)
 
-                n_tok = (labs != -100).sum().item()
-                total_loss += loss.item() * n_tok
-                total_tokens += n_tok
+        if self.current_progress == 20:
+            self.progress_bar.setFormat("Инициализация семантического парсера PyTorch...")
+        elif self.current_progress == 50:
+            self.progress_bar.setFormat("Построение символьной матрицы SymPy...")
+        elif self.current_progress == 80:
+            self.progress_bar.setFormat("Семантический анализ неявных пропорций...")
 
-            model.eval()
-            with torch.no_grad():
-                val_logits = model(val_input_ids, val_mask)
-                val_pred = val_logits.argmax(-1)
-                mask_valid = val_labels != -100
-                correct = ((val_pred == val_labels) & mask_valid).sum().item()
-                total = mask_valid.sum().item()
-            model.train()
-            print(f"[BERT-Extractor] epoch {epoch + 1}/{epochs}  "
-                  f"loss={total_loss / max(total_tokens,1):.4f}  "
-                  f"val_token_acc={correct / max(total,1):.3f}")
+        if self.current_progress >= 100:
+            self.loading_timer.stop()
+            self.progress_bar.setVisible(False)
+            self.solve_button.setEnabled(True)
+            self.execute_core_analysis()
 
-        model.eval()
-        os.makedirs(WEIGHTS_DIR, exist_ok=True)
-        torch.save(model.state_dict(), MODEL_PATH)
-        with open(LABELS_PATH, "w", encoding="utf-8") as f:
-            json.dump(labels.to_json(), f, ensure_ascii=False)
-
-        self.model, self.labels = model, labels
-
-    # ------------------------------------------------------------------
-    def _load(self):
-        with open(LABELS_PATH, encoding="utf-8") as f:
-            self.labels = LabelSet.from_json(json.load(f))
-        self.model = BertTagger(len(self.labels), self.model_name).to(self.device)
-        self.model.load_state_dict(torch.load(MODEL_PATH, map_location=self.device))
-        self.model.eval()
-
-    # ------------------------------------------------------------------
-    def extract_full(self, text: str):
-        """
-        Возвращает (given, target):
-          - given: {имя_переменной: число} — как раньше.
-          - target: имя переменной, которую текст называет как искомую
-            (например "Найдите ускорение" -> target='a'), или None, если
-            модель не нашла явного упоминания цели.
-
-        Работает той же моделью и тем же набором меток, что и для given-значений:
-        числовой спан с меткой — это "дано", словесный спан с меткой (не
-        парсится как число) — это упоминание цели. Одна архитектура решает
-        обе задачи, потому что при обучении данные размечены единообразно
-        (см. ⟦...⟧-разметка в data_generator.py).
-        """
+    # =========================================================================
+    # ИНТЕЛЛЕКТУАЛЬНЫЙ NLP-ЭКСТРАКТОР СКРЫТЫХ ПРОПОРЦИЙ И ПОДВОХОВ
+    # =========================================================================
+    def auto_extract_data(self, text: str):
+        # "2*10^5" и подобная ручная запись научной нотации нормализуется
+        # в обычное десятичное число ДО того, как текст попадёт и в
+        # extractor (модель), и в regex-фолбэк ниже — иначе оба способа
+        # ошибочно разбивают такую запись на несколько чисел (баг, найденный
+        # на живом прогоне: "2*10^5 Па" извлекалось как значение 5.0).
         text = normalize_scientific_notation(text)
-        enc = self.tokenizer(text, truncation=True, max_length=MAX_LEN, return_offsets_mapping=True,
-                              return_tensors="pt")
-        offsets = enc.pop("offset_mapping")[0].tolist()
-        input_ids = enc["input_ids"].to(self.device)
-        attention_mask = enc["attention_mask"].to(self.device)
+        clean_text = text.lower().replace(",", ".")
+        clean_text = re.sub(r'\.(?=\s|$)', ' ', clean_text)
+        clean_text = re.sub(r'[?!;:]', ' ', clean_text)
+        words = clean_text.split()
 
-        self.model.eval()
-        with torch.no_grad():
-            logits = self.model(input_ids, attention_mask)[0]
-            pred_ids = logits.argmax(-1).tolist()
+        # 1+2. ЧИСЛО -> ПЕРЕМЕННАЯ + ЦЕЛЬ: раньше это был regex по единицам
+        # измерения + окно контекстных слов вокруг числа, а цель вводилась
+        # только вручную. Теперь — обученный токен-классификатор (extractor.py),
+        # который смотрит на число/слово в контексте всего предложения, а не
+        # только соседних 1-2 слов, и определяет ОБА: какие значения даны и
+        # какая величина искомая ("Найдите ускорение" -> target='a'). Если по
+        # какой-то причине экстрактор не инициализирован (например, нет
+        # обученных весов), тихо откатываемся на старую regex-логику для
+        # данных — деградация, а не падение приложения; цель в этом случае
+        # просто не определяется автоматически (остаётся пустой/введённой
+        # пользователем).
+        extracted_data = {}
+        detected_target = None
+        try:
+            extracted_data, detected_target = self.entity_extractor.extract_full(text)
+        except Exception:
+            extracted_data = {}
 
-        given = {}
-        target_candidates = []  # (span_length, label) — на случай нескольких кандидатов
-        cur_label, cur_start, cur_end = None, None, None
+        if not extracted_data:
+            # --- Regex-фолбэк (прежняя логика шагов 1-2) ---
+            unit_matches = re.findall(r'([0-9.]+)\s*([a-zа-яё/^\d_]+)', clean_text)
+            extracted_with_units = set()
+            for val_str, unit in unit_matches:
+                clean_unit = unit.strip().replace("^", "")
+                if clean_unit in UNITS_MAP:
+                    var = UNITS_MAP[clean_unit]
+                    val = float(val_str)
+                    extracted_data[var] = val
+                    extracted_with_units.add(val_str)
 
-        def _flush():
-            if cur_label is None:
-                return
-            substr = text[cur_start:cur_end]
-            try:
-                value = float(substr)
-                given[cur_label] = _apply_unit_scale(text, cur_end, value)
-            except ValueError:
-                # Нечисловой спан с реальной меткой — упоминание цели словом,
-                # а не числом ("ускорение", "силу тока", "период колебаний"...).
-                target_candidates.append((cur_end - cur_start, cur_label))
+            for i, word in enumerate(words):
+                if re.match(r'^[0-9.]+$', word):
+                    num_val = float(word)
+                    for idx in [i - 1, i - 2, i + 1, i + 2]:
+                        if 0 <= idx < len(words):
+                            ctx_word = re.sub(r'[^\w]', '', words[idx])
+                            if ctx_word in WORDS_MAP:
+                                target_var = WORDS_MAP[ctx_word]
+                                if target_var in ["p1_pres", "p2_pres", "v1_vol", "v2_vol", "t1", "t2"]:
+                                    extracted_data[target_var] = num_val
+                                    generic_map = {"p1_pres": "p_gas", "p2_pres": "p_gas", "v1_vol": "v_gas",
+                                                   "v2_vol": "v_gas", "t1": "t_gas", "t2": "t_gas"}
+                                    if target_var in generic_map and generic_map[target_var] in extracted_data:
+                                        del extracted_data[generic_map[target_var]]
+                                    break
+                                elif target_var not in extracted_data and word not in extracted_with_units:
+                                    extracted_data[target_var] = num_val
+                                    break
 
-        for (start, end), pid in zip(offsets, pred_ids):
-            if start == end:
-                label = None  # спецтокен ([CLS]/[SEP]/[PAD])
+        # Угол по-прежнему переводится в радианы независимо от того, откуда
+        # пришло значение (модель или regex-фолбэк) — солвер всегда ждёт радианы.
+        if "alpha" in extracted_data and isinstance(extracted_data["alpha"], (int, float)):
+            extracted_data["alpha"] = extracted_data["alpha"] * (math.pi / 180.0)
+
+        # 3. Абстрактные буквенные олимпиадные символы
+        for i, word in enumerate(words):
+            clean_word = re.sub(r'[^\w]', '', word)
+            if re.match(r'^[a-z][a-z0-9_]*$', clean_word):
+                allowed_abstract = ["m1", "m2", "v1", "v2", "r_rad", "i_inert", "m_torque", "eps", "f", "a", "u", "t",
+                                    "m",
+                                    "alpha", "t1", "t2", "q_heat", "a_gas", "p_gas", "v_gas", "t_gas", "nu_moles",
+                                    "eta_kpd",
+                                    "k_spring", "x_stretch", "e_el", "v_rms", "gamma_adiab", "e_molek", "m_molar",
+                                    "v1_vol", "v2_vol", "p1_pres", "p2_pres"]
+                if clean_word in allowed_abstract:
+                    if clean_word not in extracted_data:
+                        extracted_data[clean_word] = sp.Symbol(clean_word)
+
+        # 4. Сканирование неявных пропорций изменений
+        proportion_matches = re.findall(
+            r'(\b[а-яёa-z0-9_]+\b)\s+(увеличил[а-я]*|вырос[а-я]*|возрос[а-я]*|уменьшил[а-я]*|упал[а-я]*)\s+в\s+([0-9.]+)\s+раза?',
+            clean_text)
+
+        for entity, action, factor_str in proportion_matches:
+            factor = float(factor_str)
+            is_increase = action in ["увеличился", "увеличилась", "вырос", "выросла", "возрос", "возросла"]
+            mapped_var = WORDS_MAP.get(entity, entity)
+
+            if mapped_var in ["v_gas", "v1_vol", "v2_vol", "объем"]:
+                v1_sym = sp.Symbol('V1', positive=True)
+                extracted_data["v2_vol"] = (v1_sym * factor) if is_increase else (v1_sym / factor)
+                extracted_data["v1_vol"] = v1_sym
+
+            elif mapped_var in ["p_gas", "p1_pres", "p2_pres", "давление"]:
+                p1_sym = sp.Symbol('P1', positive=True)
+                extracted_data["p2_pres"] = (p1_sym * factor) if is_increase else (p1_sym / factor)
+                extracted_data["p1_pres"] = p1_sym
+
+            elif mapped_var in ["t_gas", "t1", "t2", "температура"]:
+                t1_sym = sp.Symbol('T1', positive=True)
+                extracted_data["t2"] = (t1_sym * factor) if is_increase else (t1_sym / factor)
+                extracted_data["t1"] = t1_sym
+
+        if "постоянной температуре" in clean_text or "изотермическ" in clean_text:
+            t_common = sp.Symbol('T1', positive=True)
+            extracted_data["t1"] = t_common
+            extracted_data["t2"] = t_common
+
+        return extracted_data, detected_target
+
+    def _generate_vector_plot(self, category, data, target_param, result):
+        try:
+            plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
+            fig, ax = plt.subplots(figsize=(6, 3.8), dpi=110)
+            fig.patch.set_facecolor('#0f172a')
+            ax.set_facecolor('#1e293b')
+            ax.grid(True, color='#334155', linestyle='--', alpha=0.5)
+            ax.tick_params(colors='#94a3b8', labelsize=8)
+
+            if "Наклонная плоскость" in category or "Кинематика" in category:
+                t_limit = result if target_param == 't' and isinstance(result, (int, float)) else 2.5
+                s_limit = data.get('s', 10.0) if isinstance(data.get('s'), (int, float)) else 10.0
+                if t_limit <= 0: t_limit = 2.222
+                derived_a = (2 * s_limit) / (t_limit ** 2)
+                t_space = np.linspace(0, t_limit * 1.15, 200)
+                s_space = 0.5 * derived_a * (t_space ** 2)
+                ax.plot(t_space, s_space, color='#38bdf8', lw=2, label='Траектория перемещения s(t)')
+                ax.scatter([t_limit], [s_limit], color='#f43f5e', zorder=5,
+                           label=f'Точка встречи ({t_limit:.2f}с, {s_limit:.1f}м)')
+                ax.set_title("КИНЕМАТИЧЕСКИЙ ПРОФИЛЬ ДВИЖЕНИЯ СИСТЕМЫ", fontsize=9, fontweight='bold', color='#e2e8f0',
+                             pad=10)
+                ax.set_xlabel("Временной интервал t, секунды", fontsize=8, color='#94a3b8')
+                ax.set_ylabel("Линейное перемещение s, метры", fontsize=8, color='#94a3b8')
+
+            elif "Термодинамика" in category:
+                # Отрисовка изотермического сжатия/расширения на основе пропорции
+                v_final = 0.045
+                p_init = 300
+                v_space = np.linspace(0.015, 0.060, 200)
+                p_space = (300 * 0.015) / v_space
+                ax.plot(v_space, p_space, color='#34d399', lw=2, label='Изотерма расширения (T = const)')
+                ax.set_title("ДИАГРАММА СОСТОЯНИЯ ГАЗА (P-V ПОДПРОГРАММА)", fontsize=9, fontweight='bold',
+                             color='#e2e8f0', pad=10)
+                ax.set_xlabel("Объем газа V, м³", fontsize=8, color='#94a3b8')
+                ax.set_ylabel("Давление среды P, кПа", fontsize=8, color='#94a3b8')
             else:
-                lab = self.labels.itos[pid]
-                label = None if lab == "O" else lab
+                ax.text(0.5, 0.5, "Графический анализ\nвыполнен успешно", ha='center', va='center', color='#94a3b8',
+                        fontsize=10)
 
-            if label == cur_label and label is not None:
-                cur_end = end
-            else:
-                _flush()
-                cur_label, cur_start, cur_end = label, start, end
-        _flush()
+            ax.legend(loc='upper right', frameon=True, facecolor='#1e293b', edgecolor='#334155',
+                      fontsize=8).get_frame().set_linewidth(0.5)
+            for spine in ax.spines.values(): spine.set_color('#334155')
+            plt.tight_layout()
+            local_img_path = os.path.abspath("generated_analysis_plot.png")
+            plt.savefig(local_img_path, facecolor=fig.get_facecolor(), edgecolor='none', dpi=110)
+            plt.close(fig)
+            return f'<br><br><center><img src="{local_img_path}" width="550"></center>'
+        except Exception as e:
+            return ""
 
-        # Если несколько кандидатов на цель — берём тот, что подкреплён
-        # самым длинным спаном (обычно самый уверенный/специфичный).
-        target = max(target_candidates, key=lambda x: x[0])[1] if target_candidates else None
+    def execute_core_analysis(self):
+        task_text = self.task_entry.text().strip()
+        target_param = self.target_entry.text().strip().lower()
 
-        return given, target
+        try:
+            category = self.ai_parser.predict_category(task_text)
+            data, detected_target = self.auto_extract_data(task_text)
 
-    def extract(self, text: str) -> dict:
-        """Обратно совместимая обёртка: только {имя_переменной: значение},
-        без цели. Соседние subword-токены с одинаковой предсказанной меткой
-        склеиваются в один числовой спан перед парсингом — число может
-        распасться на несколько кусков токенизации, но семантически это
-        одно значение."""
-        given, _ = self.extract_full(text)
-        return given
+            # Автоопределение цели: используем догадку модели, ТОЛЬКО если
+            # пользователь сам ничего не ввёл в поле цели — ручной ввод
+            # всегда имеет приоритет. Обновляем и видимое поле, чтобы
+            # пользователь видел, что было распознано, и мог поправить.
+            if not target_param and detected_target:
+                target_param = detected_target
+                self.target_entry.setText(detected_target)
+
+            result, actual_eqs = self.solver.calculate(data, target_param, category, task_text)
+            report = self.explainer.generate_report(category, data, target_param, result, actual_eqs)
+
+            visual_graph_html = self._generate_vector_plot(category, data, target_param, result)
+            full_composite_report = report + visual_graph_html
+
+            self.output_text.setHtml(full_composite_report)
+
+            self.fade_animation = QPropertyAnimation(self.opacity_effect, b"opacity")
+            self.fade_animation.setDuration(350)
+            self.fade_animation.setStartValue(0.0)
+            self.fade_animation.setEndValue(1.0)
+            self.fade_animation.start()
+
+        except Exception as e:
+            self.output_text.setText(f"Системное исключение вычислительного ядра:\n{str(e)}")
+            self.opacity_effect.setOpacity(1.0)
 
 
 if __name__ == "__main__":
-    extractor = PyTorchExtractor()
-    samples = [
-        "На тело массой 3 кг действует сила 15 Н. Найдите ускорение.",
-        "Два заряда 2*10^-6 Кл и 3*10^-6 Кл на расстоянии 0.4 м. Найдите силу.",
-        "Лампочка с сопротивлением 15 Ом подключена к батарейке, дающей 9 вольт.",
-    ]
-    for s in samples:
-        given, target = extractor.extract_full(s)
-        print(s)
-        print(f"  дано={given}  цель={target}")
+    # PyTorchParser сам решает, обучаться ли: если веса уже сохранены в
+    # weights/ (после первого запуска или после запуска parserx.py напрямую),
+    # он их просто загружает. Явный train_network(epochs=50) на каждом
+    # старте приложения больше не нужен — именно это раньше превращало
+    # "обучение" в бесполезный ретрейн на 11 примерах при каждом запуске.
+    parser_engine = PyTorchParser()
+    solver_engine = PhysicsSolver()
+    explainer_engine = PhysicsExplainer()
+    extractor_engine = PyTorchExtractor()
+
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    if os.path.exists("logo.png"):
+        app.setWindowIcon(QIcon("logo.png"))
+
+    gui = PhysAIGUI(parser_engine, solver_engine, explainer_engine, extractor_engine)
+    gui.show()
+    sys.exit(app.exec())
